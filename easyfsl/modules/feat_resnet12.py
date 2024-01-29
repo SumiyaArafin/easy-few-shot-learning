@@ -1,168 +1,84 @@
-"""
-This particular ResNet12 is simplified from the original implementation of FEAT (https://github.com/Sha-Lab/FEAT).
-We provide it to allow the reproduction of the FEAT method and the use of the chekcpoints they made available.
-It contains some design choices that differ from the usual ResNet12. Use this one or the other.
-Just remember that it is important to use the same backbone for a fair comparison between methods.
-"""
-
+import torch
 from torch import nn
-from torchvision.models.resnet import conv3x3
+from torch.nn import functional as F
 
+# ... (your existing imports)
 
-class FEATBasicBlock(nn.Module):
-    """
-    BasicBlock for FEAT. Uses 3 convolutions instead of 2, a LeakyReLU instead of ReLU, and a MaxPool2d.
-    """
-
-    expansion = 1
-
-    def __init__(
-        self,
-        inplanes,
-        planes,
-        stride=1,
-        downsample=None,
-    ):
-        super().__init__()
-        self.conv1 = conv3x3(inplanes, planes)
-        self.bn1 = nn.BatchNorm2d(planes)
-        self.dropout1 = nn.Dropout(p=0.5)
-        self.relu = nn.LeakyReLU(0.1)
-        self.conv2 = conv3x3(planes, planes)
-        self.bn2 = nn.BatchNorm2d(planes)
-        self.dropout2 = nn.Dropout(p=0.5)
-
-        
-        self.downsample = downsample
-
-    def forward(self, x):  # pylint: disable=invalid-name
-        """
-        Pass input through the block, including an activation and maxpooling at the end.
-        """
-
-        residual = x
-
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.dropout1(out)
-
-        out = self.relu(out)
-
-        out = self.conv2(out)
-        out = self.bn2(out)
-        out = self.dropout2(out)
-
-
-        if self.downsample is not None:
-            residual = self.downsample(x)
-        out += residual
-
-        out = self.relu(out)
-        out = self.maxpool(out)
-
-        return out
-
-
-class FEATResNet12(nn.Module):
-    """
-    ResNet12 for FEAT. See feat_resnet12 doc for more details.
+class FERAttentionNetWithAttentionModule(nn.Module):
+    """FERAttentionNet with attention module
     """
 
-    def __init__(
-        self,
-        block=FEATBasicBlock,
-    ):
-        self.inplanes = 3
+    def __init__(self, dim=32, num_classes=1, num_channels=3, backbone='preactresnet', num_filters=32):
         super().__init__()
 
-        channels = [64, 160, 320]
-        self.layer_dims = [
-            channels[i] * block.expansion for i in range(4) for j in range(4)
-        ]
+        # Attention module
+        self.attention_map = AttentionResNet(in_channels=num_channels, out_channels=num_classes, pretrained=True)
 
-        self.layer1 = self._make_layer(
-            block,
-            64,
-            stride=2,
+        # Feature module
+        self.conv_input = nn.Conv2d(in_channels=num_channels, out_channels=num_classes, kernel_size=9, stride=1, padding=4,
+                                   bias=True)
+        self.feature = self.make_layer(_Residual_Block_SR, 8, num_classes)
+        self.conv_mid = nn.Conv2d(in_channels=num_classes, out_channels=num_classes, kernel_size=3, stride=1, padding=1,
+                                  bias=True)
+
+        # Reconstruction module
+        self.reconstruction = nn.Sequential(
+            ConvRelu(2 * num_classes + num_channels, num_filters),
+            nn.Conv2d(in_channels=num_filters, out_channels=num_channels, kernel_size=1, stride=1, padding=0, bias=True),
         )
-        self.layer2 = self._make_layer(
-            block,
-            160,
-            stride=2,
-        )
-        self.layer3 = self._make_layer(
-            block,
-            320,
-            stride=2,
-        )
+        self.conv2_bn = nn.BatchNorm2d(num_channels)
 
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                nn.init.kaiming_normal_(
-                    module.weight, mode="fan_out", nonlinearity="leaky_relu"
-                )
-            elif isinstance(module, nn.BatchNorm2d):
-                nn.init.constant_(module.weight, 1)
-                nn.init.constant_(module.bias, 0)
+        # Select backbone classification
+        self.backbone = backbone
+        if self.backbone == 'preactresnet':
+            self.netclass = preactresnet.preactresnet18(num_classes=num_classes, num_channels=num_channels)
+        elif self.backbone == 'inception':
+            self.netclass = inception.inception_v3(num_classes=num_classes, num_channels=num_channels,
+                                                    transform_input=False, pretrained=True)
+        elif self.backbone == 'resnet':
+            self.netclass = resnet.resnet18(num_classes=num_classes, num_channels=num_channels)
+        elif self.backbone == 'cvgg':
+            self.netclass = cvgg.cvgg13(num_classes=num_classes, num_channels=num_channels)
+        else:
+            assert (False)
 
-    def _make_layer(self, block, planes, stride=1):
-        downsample = None
-        if stride != 1 or self.inplanes != planes * block.expansion:
-            downsample = nn.Sequential(
-                nn.Conv2d(
-                    self.inplanes,
-                    planes * block.expansion,
-                    kernel_size=1,
-                    stride=1,
-                    bias=False,
-                ),
-                nn.BatchNorm2d(planes * block.expansion),
-            )
-
+    def make_layer(self, block, num_of_layer, num_ft):
         layers = []
-        layers.append(
-            block(
-                self.inplanes,
-                planes,
-                stride,
-                downsample,
-            )
-        )
-        self.inplanes = planes * block.expansion
-
+        for _ in range(num_of_layer):
+            layers.append(block(num_ft))
         return nn.Sequential(*layers)
 
-    def forward(self, x):  # pylint: disable=invalid-name
-        """
-        Iterate over the blocks and apply them sequentially.
-        """
-        x = self.layer3(self.layer2(self.layer1(x)))
-        return x.mean((-2, -1))
+    def forward(self, x, x_org=None):
 
+        # Attention map
+        g_att = self.attention_map(x)
 
-def feat_resnet12(**kwargs):
-    """
-    Build a ResNet12 model as used in the FEAT paper, following the implementation of
-    https://github.com/Sha-Lab/FEAT.
-    This ResNet network also follows the practice of the following papers:
-    TADAM: Task dependent adaptive metric for improved few-shot learning (Oreshkin et al., in NIPS 2018) and
-    A Simple Neural Attentive Meta-Learner (Mishra et al., in ICLR 2018).
+        # Feature module
+        out = self.conv_input(x)
+        residual = out
+        out = self.feature(out)
+        out = self.conv_mid(out)
+        g_ft = torch.add(out, residual)
 
-    There are 4 main differences with the other ResNet models used in EasyFSL:
-        - There is no first convolutional layer (3x3, 64) before the first block.
-        - The stride of the first block is 2 instead of 1.
-        - The BasicBlock uses 3 convolutional layers, instead of 2 in the standard torch implementation.
-        - We don't initialize the last fully connected layer, since we never use it.
+        # Fusion
+        # \sigma(A) * F(I)
+        attmap = torch.mul(torch.sigmoid(g_att), g_ft)
+        att = self.reconstruction(torch.cat((attmap, x, g_att), dim=1))
+        att = F.relu(self.conv2_bn(att))
+        att_out = normalize_layer(att)
 
-    Note that we removed the Dropout logic from the original implementation, as it is not part of the paper.
+        # Select backbone classification
+        if self.backbone == 'preactresnet':
+            att_pool = F.avg_pool2d(att_out, 2)
+        elif self.backbone == 'inception':
+            att_pool = F.interpolate(att_out, size=(299, 299), mode='bilinear', align_corners=False)
+        elif self.backbone == 'resnet':
+            att_pool = F.interpolate(att_out, size=(224, 224), mode='bilinear', align_corners=False)
+        elif self.backbone == 'cvgg':
+            att_pool = att_out
+        else:
+            assert (False)
 
-    Args:
-        **kwargs: Additional arguments to pass to the FEATResNet12 class.
+        y = self.netclass(att_pool)
 
-    Returns:
-        The standard ResNet12 from FEAT model.
-    """
-    return FEATResNet12(FEATBasicBlock, **kwargs)
-
-
-
+        return y, att, g_att, g_ft
